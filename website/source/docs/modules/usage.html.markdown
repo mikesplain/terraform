@@ -54,7 +54,7 @@ resource "aws_iam_user" "deploy_user" {
 
 In this example you define a module in the `./publish_bucket` subdirectory. That module has configuration to create a bucket resource, set access and caching rules. The module wraps the bucket and all the other implementation details required to configure a bucket.
 
-We can then define the module multiple times in our configuration by naming each instantiation of the module uniquely, here `module "assets_bucket"` and `module "media_bucket"`, whilst specifying the same module `source`. 
+We can then define the module multiple times in our configuration by naming each instantiation of the module uniquely, here `module "assets_bucket"` and `module "media_bucket"`, whilst specifying the same module `source`.
 
 The resource names in your module  get prefixed by `module.<module-instance-name>` when instantiated, for example the `publish_bucket` module creates `aws_s3_bucket.the_bucket` and `aws_iam_access_key.deploy_user`. The full name of the resulting resources will be `module.assets_bucket.aws_s3_bucket.the_bucket` and `module.assets_bucket.aws_iam_access_key.deploy_user`. Be cautious of this when extracting configuration from your files into a module, the name of your resources will change and Terraform will potentially destroy and recreate them. Always check your configuration with `terraform plan` before running `terraform apply`.
 
@@ -96,6 +96,12 @@ resource "aws_instance" "client" {
 This purposely is very similar to accessing resource attributes. Instead of mapping to a resource, however, the variable in this case maps to an output of a module.
 
 Just like resources, this will create a dependency from the `aws_instance.client` resource to the module, so the module will be built first.
+
+To use module outputs via command line you have to specify the module name before the variable, for example:
+
+```
+terraform output -module=consul server_availability_zone
+```
 
 ## Plans and Graphs
 

@@ -3,6 +3,8 @@ package datadog
 import (
 	"log"
 
+	"errors"
+
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/terraform"
 )
@@ -25,6 +27,7 @@ func Provider() terraform.ResourceProvider {
 		ResourcesMap: map[string]*schema.Resource{
 			"datadog_monitor":   resourceDatadogMonitor(),
 			"datadog_timeboard": resourceDatadogTimeboard(),
+			"datadog_user":      resourceDatadogUser(),
 		},
 
 		ConfigureFunc: providerConfigure,
@@ -39,5 +42,17 @@ func providerConfigure(d *schema.ResourceData) (interface{}, error) {
 	}
 
 	log.Println("[INFO] Initializing Datadog client")
-	return config.Client()
+	client := config.Client()
+
+	ok, err := client.Validate()
+
+	if err != nil {
+		return client, err
+	}
+
+	if ok == false {
+		return client, errors.New(`No valid credential sources found for Datadog Provider. Please see https://terraform.io/docs/providers/datadog/index.html for more information on providing credentials for the Datadog Provider`)
+	}
+
+	return client, nil
 }

@@ -19,13 +19,14 @@ type hclConfigurable struct {
 
 func (t *hclConfigurable) Config() (*Config, error) {
 	validKeys := map[string]struct{}{
-		"atlas":    struct{}{},
-		"data":     struct{}{},
-		"module":   struct{}{},
-		"output":   struct{}{},
-		"provider": struct{}{},
-		"resource": struct{}{},
-		"variable": struct{}{},
+		"atlas":     struct{}{},
+		"data":      struct{}{},
+		"module":    struct{}{},
+		"output":    struct{}{},
+		"provider":  struct{}{},
+		"resource":  struct{}{},
+		"terraform": struct{}{},
+		"variable":  struct{}{},
 	}
 
 	// Top-level item should be the object list
@@ -36,6 +37,15 @@ func (t *hclConfigurable) Config() (*Config, error) {
 
 	// Start building up the actual configuration.
 	config := new(Config)
+
+	// Terraform config
+	if o := list.Filter("terraform"); len(o.Items) > 0 {
+		var err error
+		config.Terraform, err = loadTerraformHcl(o)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Build the variables
 	if vars := list.Filter("variable"); len(vars.Items) > 0 {
@@ -190,6 +200,93 @@ func loadFileHcl(root string) (configurable, []string, error) {
 	return result, nil, nil
 }
 
+// Given a handle to a HCL object, this transforms it into the Terraform config
+func loadTerraformHcl(list *ast.ObjectList) (*Terraform, error) {
+	if len(list.Items) > 1 {
+		return nil, fmt.Errorf("only one 'terraform' block allowed per module")
+	}
+
+	// Get our one item
+	item := list.Items[0]
+
+	// We need the item value as an ObjectList
+	var listVal *ast.ObjectList
+	if ot, ok := item.Val.(*ast.ObjectType); ok {
+		listVal = ot.List
+	} else {
+		return nil, fmt.Errorf("terraform block: should be an object")
+	}
+
+	// NOTE: We purposely don't validate unknown HCL keys here so that
+	// we can potentially read _future_ Terraform version config (to
+	// still be able to validate the required version).
+	//
+	// We should still keep track of unknown keys to validate later, but
+	// HCL doesn't currently support that.
+
+	var config Terraform
+	if err := hcl.DecodeObject(&config, item.Val); err != nil {
+		return nil, fmt.Errorf(
+			"Error reading terraform config: %s",
+			err)
+	}
+
+	// If we have provisioners, then parse those out
+	if os := listVal.Filter("backend"); len(os.Items) > 0 {
+		var err error
+		config.Backend, err = loadTerraformBackendHcl(os)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"Error reading backend config for terraform block: %s",
+				err)
+		}
+	}
+
+	return &config, nil
+}
+
+// Loads the Backend configuration from an object list.
+func loadTerraformBackendHcl(list *ast.ObjectList) (*Backend, error) {
+	if len(list.Items) > 1 {
+		return nil, fmt.Errorf("only one 'backend' block allowed")
+	}
+
+	// Get our one item
+	item := list.Items[0]
+
+	// Verify the keys
+	if len(item.Keys) != 1 {
+		return nil, fmt.Errorf(
+			"position %s: 'backend' must be followed by exactly one string: a type",
+			item.Pos())
+	}
+
+	typ := item.Keys[0].Token.Value().(string)
+
+	// Decode the raw config
+	var config map[string]interface{}
+	if err := hcl.DecodeObject(&config, item.Val); err != nil {
+		return nil, fmt.Errorf(
+			"Error reading backend config: %s",
+			err)
+	}
+
+	rawConfig, err := NewRawConfig(config)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"Error reading backend config: %s",
+			err)
+	}
+
+	b := &Backend{
+		Type:      typ,
+		RawConfig: rawConfig,
+	}
+	b.Hash = b.Rehash()
+
+	return b, nil
+}
+
 // Given a handle to a HCL object, this transforms it into the Atlas
 // configuration.
 func loadAtlasHcl(list *ast.ObjectList) (*AtlasConfig, error) {
@@ -292,10 +389,20 @@ func loadOutputsHcl(list *ast.ObjectList) ([]*Output, error) {
 	for _, item := range list.Items {
 		n := item.Keys[0].Token.Value().(string)
 
+		var listVal *ast.ObjectList
+		if ot, ok := item.Val.(*ast.ObjectType); ok {
+			listVal = ot.List
+		} else {
+			return nil, fmt.Errorf("output '%s': should be an object", n)
+		}
+
 		var config map[string]interface{}
 		if err := hcl.DecodeObject(&config, item.Val); err != nil {
 			return nil, err
 		}
+
+		// Delete special keys
+		delete(config, "depends_on")
 
 		rawConfig, err := NewRawConfig(config)
 		if err != nil {
@@ -305,9 +412,22 @@ func loadOutputsHcl(list *ast.ObjectList) ([]*Output, error) {
 				err)
 		}
 
+		// If we have depends fields, then add those in
+		var dependsOn []string
+		if o := listVal.Filter("depends_on"); len(o.Items) > 0 {
+			err := hcl.DecodeObject(&dependsOn, o.Items[0].Val)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"Error reading depends_on for output %q: %s",
+					n,
+					err)
+			}
+		}
+
 		result = append(result, &Output{
 			Name:      n,
 			RawConfig: rawConfig,
+			DependsOn: dependsOn,
 		})
 	}
 
@@ -345,15 +465,18 @@ func loadVariablesHcl(list *ast.ObjectList) ([]*Variable, error) {
 		}
 
 		n := item.Keys[0].Token.Value().(string)
+		if !NameRegexp.MatchString(n) {
+			return nil, fmt.Errorf(
+				"position %s: 'variable' name must match regular expression: %s",
+				item.Pos(), NameRegexp)
+		}
 
-		/*
-			// TODO: catch extra fields
-			// Decode into raw map[string]interface{} so we know ALL fields
-			var config map[string]interface{}
-			if err := hcl.DecodeObject(&config, item.Val); err != nil {
-				return nil, err
-			}
-		*/
+		// Check for invalid keys
+		valid := []string{"type", "default", "description"}
+		if err := checkHCLKeys(item.Val, valid); err != nil {
+			return nil, multierror.Prefix(err, fmt.Sprintf(
+				"variable[%s]:", n))
+		}
 
 		// Decode into hclVariable to get typed values
 		var hclVar hclVariable
@@ -717,6 +840,12 @@ func loadManagedResourcesHcl(list *ast.ObjectList) ([]*Resource, error) {
 		// destroying the existing instance
 		var lifecycle ResourceLifecycle
 		if o := listVal.Filter("lifecycle"); len(o.Items) > 0 {
+			if len(o.Items) > 1 {
+				return nil, fmt.Errorf(
+					"%s[%s]: Multiple lifecycle blocks found, expected one",
+					t, k)
+			}
+
 			// Check for invalid keys
 			valid := []string{"create_before_destroy", "ignore_changes", "prevent_destroy"}
 			if err := checkHCLKeys(o.Items[0].Val, valid); err != nil {
@@ -781,8 +910,40 @@ func loadProvisionersHcl(list *ast.ObjectList, connInfo map[string]interface{}) 
 			return nil, err
 		}
 
-		// Delete the "connection" section, handle separately
+		// Parse the "when" value
+		when := ProvisionerWhenCreate
+		if v, ok := config["when"]; ok {
+			switch v {
+			case "create":
+				when = ProvisionerWhenCreate
+			case "destroy":
+				when = ProvisionerWhenDestroy
+			default:
+				return nil, fmt.Errorf(
+					"position %s: 'provisioner' when must be 'create' or 'destroy'",
+					item.Pos())
+			}
+		}
+
+		// Parse the "on_failure" value
+		onFailure := ProvisionerOnFailureFail
+		if v, ok := config["on_failure"]; ok {
+			switch v {
+			case "continue":
+				onFailure = ProvisionerOnFailureContinue
+			case "fail":
+				onFailure = ProvisionerOnFailureFail
+			default:
+				return nil, fmt.Errorf(
+					"position %s: 'provisioner' on_failure must be 'continue' or 'fail'",
+					item.Pos())
+			}
+		}
+
+		// Delete fields we special case
 		delete(config, "connection")
+		delete(config, "when")
+		delete(config, "on_failure")
 
 		rawConfig, err := NewRawConfig(config)
 		if err != nil {
@@ -821,6 +982,8 @@ func loadProvisionersHcl(list *ast.ObjectList, connInfo map[string]interface{}) 
 			Type:      n,
 			RawConfig: rawConfig,
 			ConnInfo:  connRaw,
+			When:      when,
+			OnFailure: onFailure,
 		})
 	}
 

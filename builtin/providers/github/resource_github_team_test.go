@@ -1,6 +1,7 @@
 package github
 
 import (
+	"context"
 	"fmt"
 	"testing"
 
@@ -17,19 +18,37 @@ func TestAccGithubTeam_basic(t *testing.T) {
 		Providers:    testAccProviders,
 		CheckDestroy: testAccCheckGithubTeamDestroy,
 		Steps: []resource.TestStep{
-			resource.TestStep{
+			{
 				Config: testAccGithubTeamConfig,
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckGithubTeamExists("github_team.foo", &team),
 					testAccCheckGithubTeamAttributes(&team, "foo", "Terraform acc test group"),
 				),
 			},
-			resource.TestStep{
+			{
 				Config: testAccGithubTeamUpdateConfig,
 				Check: resource.ComposeTestCheckFunc(
 					testAccCheckGithubTeamExists("github_team.foo", &team),
 					testAccCheckGithubTeamAttributes(&team, "foo2", "Terraform acc test group - updated"),
 				),
+			},
+		},
+	})
+}
+
+func TestAccGithubTeam_importBasic(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:     func() { testAccPreCheck(t) },
+		Providers:    testAccProviders,
+		CheckDestroy: testAccCheckGithubTeamDestroy,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccGithubTeamConfig,
+			},
+			{
+				ResourceName:      "github_team.foo",
+				ImportState:       true,
+				ImportStateVerify: true,
 			},
 		},
 	})
@@ -47,7 +66,7 @@ func testAccCheckGithubTeamExists(n string, team *github.Team) resource.TestChec
 		}
 
 		conn := testAccProvider.Meta().(*Organization).client
-		githubTeam, _, err := conn.Organizations.GetTeam(toGithubID(rs.Primary.ID))
+		githubTeam, _, err := conn.Organizations.GetTeam(context.TODO(), toGithubID(rs.Primary.ID))
 		if err != nil {
 			return err
 		}
@@ -78,7 +97,7 @@ func testAccCheckGithubTeamDestroy(s *terraform.State) error {
 			continue
 		}
 
-		team, resp, err := conn.Organizations.GetTeam(toGithubID(rs.Primary.ID))
+		team, resp, err := conn.Organizations.GetTeam(context.TODO(), toGithubID(rs.Primary.ID))
 		if err == nil {
 			if team != nil &&
 				fromGithubID(team.ID) == rs.Primary.ID {

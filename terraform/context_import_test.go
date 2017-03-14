@@ -32,7 +32,6 @@ func TestContextImport_basic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err: %s", err)
 	}
-
 	actual := strings.TrimSpace(state.String())
 	expected := strings.TrimSpace(testImportStr)
 	if actual != expected {
@@ -206,6 +205,53 @@ func TestContextImport_moduleProvider(t *testing.T) {
 	expected := strings.TrimSpace(testImportStr)
 	if actual != expected {
 		t.Fatalf("bad: \n%s", actual)
+	}
+}
+
+// Test that import sets up the graph properly for provider inheritance
+func TestContextImport_providerInherit(t *testing.T) {
+	p := testProvider("aws")
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[string]ResourceProviderFactory{
+			"aws": testProviderFuncFixed(p),
+		},
+	})
+
+	p.ImportStateReturn = []*InstanceState{
+		&InstanceState{
+			ID:        "foo",
+			Ephemeral: EphemeralState{Type: "aws_instance"},
+		},
+	}
+
+	configured := false
+	p.ConfigureFn = func(c *ResourceConfig) error {
+		configured = true
+
+		if v, ok := c.Get("foo"); !ok || v.(string) != "bar" {
+			return fmt.Errorf("bad")
+		}
+
+		return nil
+	}
+
+	m := testModule(t, "import-provider-inherit")
+
+	_, err := ctx.Import(&ImportOpts{
+		Module: m,
+		Targets: []*ImportTarget{
+			&ImportTarget{
+				Addr: "module.child.aws_instance.foo",
+				ID:   "bar",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	if !configured {
+		t.Fatal("didn't configure provider")
 	}
 }
 
@@ -621,6 +667,41 @@ func TestContextImport_multiStateSame(t *testing.T) {
 	}
 }
 
+func TestContextImport_customProvider(t *testing.T) {
+	p := testProvider("aws")
+	ctx := testContext2(t, &ContextOpts{
+		Providers: map[string]ResourceProviderFactory{
+			"aws": testProviderFuncFixed(p),
+		},
+	})
+
+	p.ImportStateReturn = []*InstanceState{
+		&InstanceState{
+			ID:        "foo",
+			Ephemeral: EphemeralState{Type: "aws_instance"},
+		},
+	}
+
+	state, err := ctx.Import(&ImportOpts{
+		Targets: []*ImportTarget{
+			&ImportTarget{
+				Addr:     "aws_instance.foo",
+				ID:       "bar",
+				Provider: "aws.alias",
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("err: %s", err)
+	}
+
+	actual := strings.TrimSpace(state.String())
+	expected := strings.TrimSpace(testImportCustomProviderStr)
+	if actual != expected {
+		t.Fatalf("bad: \n%s", actual)
+	}
+}
+
 const testImportStr = `
 aws_instance.foo:
   ID = foo
@@ -699,4 +780,10 @@ aws_instance.foo:
   ID = foo
   provider = aws
   foo = bar
+`
+
+const testImportCustomProviderStr = `
+aws_instance.foo:
+  ID = foo
+  provider = aws.alias
 `

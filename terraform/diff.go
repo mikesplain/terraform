@@ -291,16 +291,22 @@ func (d *ModuleDiff) String() string {
 		switch {
 		case rdiff.RequiresNew() && (rdiff.GetDestroy() || rdiff.GetDestroyTainted()):
 			crud = "DESTROY/CREATE"
-		case rdiff.GetDestroy():
+		case rdiff.GetDestroy() || rdiff.GetDestroyDeposed():
 			crud = "DESTROY"
 		case rdiff.RequiresNew():
 			crud = "CREATE"
 		}
 
+		extra := ""
+		if !rdiff.GetDestroy() && rdiff.GetDestroyDeposed() {
+			extra = " (deposed only)"
+		}
+
 		buf.WriteString(fmt.Sprintf(
-			"%s: %s\n",
+			"%s: %s%s\n",
 			crud,
-			name))
+			name,
+			extra))
 
 		keyLen := 0
 		rdiffAttrs := rdiff.CopyAttributes()
@@ -356,7 +362,14 @@ type InstanceDiff struct {
 	mu             sync.Mutex
 	Attributes     map[string]*ResourceAttrDiff
 	Destroy        bool
+	DestroyDeposed bool
 	DestroyTainted bool
+
+	// Meta is a simple K/V map that is stored in a diff and persisted to
+	// plans but otherwise is completely ignored by Terraform core. It is
+	// mean to be used for additional data a resource may want to pass through.
+	// The value here must only contain Go primitives and collections.
+	Meta map[string]interface{}
 }
 
 func (d *InstanceDiff) Lock()   { d.mu.Lock() }
@@ -430,7 +443,7 @@ func (d *InstanceDiff) ChangeType() DiffChangeType {
 		return DiffDestroyCreate
 	}
 
-	if d.GetDestroy() {
+	if d.GetDestroy() || d.GetDestroyDeposed() {
 		return DiffDestroy
 	}
 
@@ -449,7 +462,10 @@ func (d *InstanceDiff) Empty() bool {
 
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return !d.Destroy && !d.DestroyTainted && len(d.Attributes) == 0
+	return !d.Destroy &&
+		!d.DestroyTainted &&
+		!d.DestroyDeposed &&
+		len(d.Attributes) == 0
 }
 
 // Equal compares two diffs for exact equality.
@@ -482,6 +498,7 @@ func (d *InstanceDiff) GoString() string {
 		Attributes:     d.Attributes,
 		Destroy:        d.Destroy,
 		DestroyTainted: d.DestroyTainted,
+		DestroyDeposed: d.DestroyDeposed,
 	})
 }
 
@@ -514,6 +531,20 @@ func (d *InstanceDiff) requiresNew() bool {
 	}
 
 	return false
+}
+
+func (d *InstanceDiff) GetDestroyDeposed() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	return d.DestroyDeposed
+}
+
+func (d *InstanceDiff) SetDestroyDeposed(b bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	d.DestroyDeposed = b
 }
 
 // These methods are properly locked, for use outside other InstanceDiff
@@ -606,13 +637,74 @@ func (d *InstanceDiff) Same(d2 *InstanceDiff) (bool, string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if d.Destroy != d2.GetDestroy() {
+	// If we're going from requiring new to NOT requiring new, then we have
+	// to see if all required news were computed. If so, it is allowed since
+	// computed may also mean "same value and therefore not new".
+	oldNew := d.requiresNew()
+	newNew := d2.RequiresNew()
+	if oldNew && !newNew {
+		oldNew = false
+
+		// This section builds a list of ignorable attributes for requiresNew
+		// by removing off any elements of collections going to zero elements.
+		// For collections going to zero, they may not exist at all in the
+		// new diff (and hence RequiresNew == false).
+		ignoreAttrs := make(map[string]struct{})
+		for k, diffOld := range d.Attributes {
+			if !strings.HasSuffix(k, ".%") && !strings.HasSuffix(k, ".#") {
+				continue
+			}
+
+			// This case is in here as a protection measure. The bug that this
+			// code originally fixed (GH-11349) didn't have to deal with computed
+			// so I'm not 100% sure what the correct behavior is. Best to leave
+			// the old behavior.
+			if diffOld.NewComputed {
+				continue
+			}
+
+			// We're looking for the case a map goes to exactly 0.
+			if diffOld.New != "0" {
+				continue
+			}
+
+			// Found it! Ignore all of these. The prefix here is stripping
+			// off the "%" so it is just "k."
+			prefix := k[:len(k)-1]
+			for k2, _ := range d.Attributes {
+				if strings.HasPrefix(k2, prefix) {
+					ignoreAttrs[k2] = struct{}{}
+				}
+			}
+		}
+
+		for k, rd := range d.Attributes {
+			if _, ok := ignoreAttrs[k]; ok {
+				continue
+			}
+
+			// If the field is requires new and NOT computed, then what
+			// we have is a diff mismatch for sure. We set that the old
+			// diff does REQUIRE a ForceNew.
+			if rd != nil && rd.RequiresNew && !rd.NewComputed {
+				oldNew = true
+				break
+			}
+		}
+	}
+
+	if oldNew != newNew {
+		return false, fmt.Sprintf(
+			"diff RequiresNew; old: %t, new: %t", oldNew, newNew)
+	}
+
+	// Verify that destroy matches. The second boolean here allows us to
+	// have mismatching Destroy if we're moving from RequiresNew true
+	// to false above. Therefore, the second boolean will only pass if
+	// we're moving from Destroy: true to false as well.
+	if d.Destroy != d2.GetDestroy() && d.requiresNew() == oldNew {
 		return false, fmt.Sprintf(
 			"diff: Destroy; old: %t, new: %t", d.Destroy, d2.GetDestroy())
-	}
-	if d.requiresNew() != d2.RequiresNew() {
-		return false, fmt.Sprintf(
-			"diff RequiresNew; old: %t, new: %t", d.requiresNew(), d2.RequiresNew())
 	}
 
 	// Go through the old diff and make sure the new diff has all the

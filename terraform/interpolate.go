@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,6 +25,7 @@ const (
 // for interpolations such as `aws_instance.foo.bar`.
 type Interpolater struct {
 	Operation          walkOperation
+	Meta               *ContextMeta
 	Module             *module.Tree
 	State              *State
 	StateLock          *sync.RWMutex
@@ -46,6 +45,10 @@ type InterpolationScope struct {
 func (i *Interpolater) Values(
 	scope *InterpolationScope,
 	vars map[string]config.InterpolatedVariable) (map[string]ast.Variable, error) {
+	if scope == nil {
+		scope = &InterpolationScope{}
+	}
+
 	result := make(map[string]ast.Variable, len(vars))
 
 	// Copy the default variables
@@ -85,6 +88,8 @@ func (i *Interpolater) Values(
 			err = i.valueSelfVar(scope, n, v, result)
 		case *config.SimpleVariable:
 			err = i.valueSimpleVar(scope, n, v, result)
+		case *config.TerraformVariable:
+			err = i.valueTerraformVar(scope, n, v, result)
 		case *config.UserVariable:
 			err = i.valueUserVar(scope, n, v, result)
 		default:
@@ -156,6 +161,13 @@ func (i *Interpolater) valueModuleVar(
 		// ensure that the module is in the state, so if we reach this
 		// point otherwise it really is a panic.
 		result[n] = unknownVariable()
+
+		// During apply this is always an error
+		if i.Operation == walkApply {
+			return fmt.Errorf(
+				"Couldn't find module %q for var: %s",
+				v.Name, v.FullKey())
+		}
 	} else {
 		// Get the value from the outputs
 		if outputState, ok := mod.Outputs[v.Field]; ok {
@@ -167,6 +179,13 @@ func (i *Interpolater) valueModuleVar(
 		} else {
 			// Same reasons as the comment above.
 			result[n] = unknownVariable()
+
+			// During apply this is always an error
+			if i.Operation == walkApply {
+				return fmt.Errorf(
+					"Couldn't find output %q for module var: %s",
+					v.Field, v.FullKey())
+			}
 		}
 	}
 
@@ -287,10 +306,29 @@ func (i *Interpolater) valueSimpleVar(
 	// relied on this for their template_file data sources. We should
 	// remove this at some point but there isn't any rush.
 	return fmt.Errorf(
-		"invalid variable syntax: %q. If this is part of inline `template` parameter\n" +
-			"then you must escape the interpolation with two dollar signs. For\n" +
-			"example: ${a} becomes $${a}." +
-			n)
+		"invalid variable syntax: %q. If this is part of inline `template` parameter\n"+
+			"then you must escape the interpolation with two dollar signs. For\n"+
+			"example: ${a} becomes $${a}.",
+		n)
+}
+
+func (i *Interpolater) valueTerraformVar(
+	scope *InterpolationScope,
+	n string,
+	v *config.TerraformVariable,
+	result map[string]ast.Variable) error {
+	if v.Field != "env" {
+		return fmt.Errorf(
+			"%s: only supported key for 'terraform.X' interpolations is 'env'", n)
+	}
+
+	if i.Meta == nil {
+		return fmt.Errorf(
+			"%s: internal error: nil Meta. Please report a bug.", n)
+	}
+
+	result[n] = ast.Variable{Type: ast.TypeString, Value: i.Meta.Env}
+	return nil
 }
 
 func (i *Interpolater) valueUserVar(
@@ -369,7 +407,12 @@ func (i *Interpolater) computeResourceVariable(
 	// If we're requesting "count" its a special variable that we grab
 	// directly from the config itself.
 	if v.Field == "count" {
-		count, err := cr.Count()
+		var count int
+		if cr != nil {
+			count, err = cr.Count()
+		} else {
+			count, err = i.resourceCountMax(module, cr, v)
+		}
 		if err != nil {
 			return nil, fmt.Errorf(
 				"Error reading %s count: %s",
@@ -380,31 +423,42 @@ func (i *Interpolater) computeResourceVariable(
 		return &ast.Variable{Type: ast.TypeInt, Value: count}, nil
 	}
 
-	// If we have no module in the state yet or count, return empty
-	if module == nil || len(module.Resources) == 0 {
-		return nil, nil
-	}
-
 	// Get the resource out from the state. We know the state exists
 	// at this point and if there is a state, we expect there to be a
 	// resource with the given name.
-	r, ok := module.Resources[id]
-	if !ok && v.Multi && v.Index == 0 {
-		r, ok = module.Resources[v.ResourceId()]
+	var r *ResourceState
+	if module != nil && len(module.Resources) > 0 {
+		var ok bool
+		r, ok = module.Resources[id]
+		if !ok && v.Multi && v.Index == 0 {
+			r, ok = module.Resources[v.ResourceId()]
+		}
+		if !ok {
+			r = nil
+		}
 	}
-	if !ok {
-		r = nil
-	}
-	if r == nil {
-		goto MISSING
-	}
+	if r == nil || r.Primary == nil {
+		if i.Operation == walkApply || i.Operation == walkPlan {
+			return nil, fmt.Errorf(
+				"Resource '%s' not found for variable '%s'",
+				v.ResourceId(),
+				v.FullKey())
+		}
 
-	if r.Primary == nil {
+		// If we have no module in the state yet or count, return empty.
+		// NOTE(@mitchellh): I actually don't know why this is here. During
+		// a refactor I kept this here to maintain the same behavior, but
+		// I'm not sure why its here.
+		if module == nil || len(module.Resources) == 0 {
+			return nil, nil
+		}
+
 		goto MISSING
 	}
 
 	if attr, ok := r.Primary.Attributes[v.Field]; ok {
-		return &ast.Variable{Type: ast.TypeString, Value: attr}, nil
+		v, err := hil.InterfaceToVariable(attr)
+		return &v, err
 	}
 
 	// computed list or map attribute
@@ -435,13 +489,15 @@ func (i *Interpolater) computeResourceVariable(
 			// Lists and sets make this
 			key := fmt.Sprintf("%s.#", strings.Join(parts[:i], "."))
 			if attr, ok := r.Primary.Attributes[key]; ok {
-				return &ast.Variable{Type: ast.TypeString, Value: attr}, nil
+				v, err := hil.InterfaceToVariable(attr)
+				return &v, err
 			}
 
 			// Maps make this
 			key = fmt.Sprintf("%s", strings.Join(parts[:i], "."))
 			if attr, ok := r.Primary.Attributes[key]; ok {
-				return &ast.Variable{Type: ast.TypeString, Value: attr}, nil
+				v, err := hil.InterfaceToVariable(attr)
+				return &v, err
 			}
 		}
 	}
@@ -464,7 +520,7 @@ MISSING:
 	//
 	// For an input walk, computed values are okay to return because we're only
 	// looking for missing variables to prompt the user for.
-	if i.Operation == walkRefresh || i.Operation == walkPlanDestroy || i.Operation == walkDestroy || i.Operation == walkInput {
+	if i.Operation == walkRefresh || i.Operation == walkPlanDestroy || i.Operation == walkInput {
 		return &unknownVariable, nil
 	}
 
@@ -551,7 +607,7 @@ func (i *Interpolater) computeResourceMultiVariable(
 		}
 
 		if multiAttr == unknownVariable {
-			return &ast.Variable{Type: ast.TypeString, Value: ""}, nil
+			return &unknownVariable, nil
 		}
 
 		values = append(values, multiAttr)
@@ -605,21 +661,8 @@ func (i *Interpolater) interpolateComplexTypeAttribute(
 			return unknownVariable(), nil
 		}
 
-		keys := make([]string, 0)
-		listElementKey := regexp.MustCompile("^" + resourceID + "\\.[0-9]+$")
-		for id := range attributes {
-			if listElementKey.MatchString(id) {
-				keys = append(keys, id)
-			}
-		}
-		sort.Strings(keys)
-
-		var members []string
-		for _, key := range keys {
-			members = append(members, attributes[key])
-		}
-
-		return hil.InterfaceToVariable(members)
+		expanded := flatmap.Expand(attributes, resourceID)
+		return hil.InterfaceToVariable(expanded)
 	}
 
 	if lengthAttr, isMap := attributes[resourceID+".%"]; isMap {
@@ -634,15 +677,7 @@ func (i *Interpolater) interpolateComplexTypeAttribute(
 			return unknownVariable(), nil
 		}
 
-		resourceFlatMap := make(map[string]string)
-		mapElementKey := regexp.MustCompile("^" + resourceID + "\\.([^%]+)$")
-		for id, val := range attributes {
-			if mapElementKey.MatchString(id) {
-				resourceFlatMap[id] = val
-			}
-		}
-
-		expanded := flatmap.Expand(resourceFlatMap, resourceID)
+		expanded := flatmap.Expand(attributes, resourceID)
 		return hil.InterfaceToVariable(expanded)
 	}
 
@@ -669,12 +704,6 @@ func (i *Interpolater) resourceVariableInfo(
 			break
 		}
 	}
-	if cr == nil {
-		return nil, nil, fmt.Errorf(
-			"Resource '%s' not found for variable '%s'",
-			v.ResourceId(),
-			v.FullKey())
-	}
 
 	// Get the relevant module
 	module := i.State.ModuleByPath(scope.Path)
@@ -691,6 +720,10 @@ func (i *Interpolater) resourceCountMax(
 	// from the state. Plan and so on may not have any state yet so
 	// we do a full interpolation.
 	if i.Operation != walkApply {
+		if cr == nil {
+			return 0, nil
+		}
+
 		count, err := cr.Count()
 		if err != nil {
 			return 0, err

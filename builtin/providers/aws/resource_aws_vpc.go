@@ -23,59 +23,76 @@ func resourceAwsVpc() *schema.Resource {
 		},
 
 		Schema: map[string]*schema.Schema{
-			"cidr_block": &schema.Schema{
+			"cidr_block": {
 				Type:         schema.TypeString,
 				Required:     true,
 				ForceNew:     true,
 				ValidateFunc: validateCIDRNetworkAddress,
 			},
 
-			"instance_tenancy": &schema.Schema{
+			"instance_tenancy": {
 				Type:     schema.TypeString,
 				Optional: true,
 				ForceNew: true,
 				Computed: true,
 			},
 
-			"enable_dns_hostnames": &schema.Schema{
+			"enable_dns_hostnames": {
 				Type:     schema.TypeBool,
 				Optional: true,
 				Computed: true,
 			},
 
-			"enable_dns_support": &schema.Schema{
+			"enable_dns_support": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  true,
+			},
+
+			"enable_classiclink": {
 				Type:     schema.TypeBool,
 				Optional: true,
 				Computed: true,
 			},
 
-			"enable_classiclink": &schema.Schema{
+			"assign_generated_ipv6_cidr_block": {
 				Type:     schema.TypeBool,
+				ForceNew: true,
 				Optional: true,
-				Computed: true,
+				Default:  false,
 			},
 
-			"main_route_table_id": &schema.Schema{
+			"main_route_table_id": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 
-			"default_network_acl_id": &schema.Schema{
+			"default_network_acl_id": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 
-			"dhcp_options_id": &schema.Schema{
+			"dhcp_options_id": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 
-			"default_security_group_id": &schema.Schema{
+			"default_security_group_id": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
 
-			"default_route_table_id": &schema.Schema{
+			"default_route_table_id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"ipv6_association_id": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
+
+			"ipv6_cidr_block": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
@@ -91,11 +108,14 @@ func resourceAwsVpcCreate(d *schema.ResourceData, meta interface{}) error {
 	if v, ok := d.GetOk("instance_tenancy"); ok {
 		instance_tenancy = v.(string)
 	}
+
 	// Create the VPC
 	createOpts := &ec2.CreateVpcInput{
-		CidrBlock:       aws.String(d.Get("cidr_block").(string)),
-		InstanceTenancy: aws.String(instance_tenancy),
+		CidrBlock:                   aws.String(d.Get("cidr_block").(string)),
+		InstanceTenancy:             aws.String(instance_tenancy),
+		AmazonProvidedIpv6CidrBlock: aws.Bool(d.Get("assign_generated_ipv6_cidr_block").(bool)),
 	}
+
 	log.Printf("[DEBUG] VPC create config: %#v", *createOpts)
 	vpcResp, err := conn.CreateVpc(createOpts)
 	if err != nil {
@@ -153,6 +173,14 @@ func resourceAwsVpcRead(d *schema.ResourceData, meta interface{}) error {
 
 	// Tags
 	d.Set("tags", tagsToMap(vpc.Tags))
+
+	if vpc.Ipv6CidrBlockAssociationSet != nil {
+		d.Set("assign_generated_ipv6_cidr_block", true)
+		d.Set("ipv6_association_id", vpc.Ipv6CidrBlockAssociationSet[0].AssociationId)
+		d.Set("ipv6_cidr_block", vpc.Ipv6CidrBlockAssociationSet[0].Ipv6CidrBlock)
+	} else {
+		d.Set("assign_generated_ipv6_cidr_block", false)
+	}
 
 	// Attributes
 	attribute := "enableDnsSupport"
@@ -251,16 +279,18 @@ func resourceAwsVpcUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 
 		log.Printf(
-			"[INFO] Modifying enable_dns_support vpc attribute for %s: %#v",
+			"[INFO] Modifying enable_dns_hostnames vpc attribute for %s: %s",
 			d.Id(), modifyOpts)
 		if _, err := conn.ModifyVpcAttribute(modifyOpts); err != nil {
 			return err
 		}
 
-		d.SetPartial("enable_dns_support")
+		d.SetPartial("enable_dns_hostnames")
 	}
 
-	if d.HasChange("enable_dns_support") {
+	_, hasEnableDnsSupportOption := d.GetOk("enable_dns_support")
+
+	if !hasEnableDnsSupportOption || d.HasChange("enable_dns_support") {
 		val := d.Get("enable_dns_support").(bool)
 		modifyOpts := &ec2.ModifyVpcAttributeInput{
 			VpcId: &vpcid,
@@ -270,7 +300,7 @@ func resourceAwsVpcUpdate(d *schema.ResourceData, meta interface{}) error {
 		}
 
 		log.Printf(
-			"[INFO] Modifying enable_dns_support vpc attribute for %s: %#v",
+			"[INFO] Modifying enable_dns_support vpc attribute for %s: %s",
 			d.Id(), modifyOpts)
 		if _, err := conn.ModifyVpcAttribute(modifyOpts); err != nil {
 			return err

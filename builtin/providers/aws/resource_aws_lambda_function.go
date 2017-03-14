@@ -34,111 +34,146 @@ func resourceAwsLambdaFunction() *schema.Resource {
 		},
 
 		Schema: map[string]*schema.Schema{
-			"filename": &schema.Schema{
+			"filename": {
 				Type:          schema.TypeString,
 				Optional:      true,
 				ConflictsWith: []string{"s3_bucket", "s3_key", "s3_object_version"},
 			},
-			"s3_bucket": &schema.Schema{
+			"s3_bucket": {
 				Type:          schema.TypeString,
 				Optional:      true,
 				ConflictsWith: []string{"filename"},
 			},
-			"s3_key": &schema.Schema{
+			"s3_key": {
 				Type:          schema.TypeString,
 				Optional:      true,
 				ConflictsWith: []string{"filename"},
 			},
-			"s3_object_version": &schema.Schema{
+			"s3_object_version": {
 				Type:          schema.TypeString,
 				Optional:      true,
 				ConflictsWith: []string{"filename"},
 			},
-			"description": &schema.Schema{
+			"description": {
 				Type:     schema.TypeString,
 				Optional: true,
 			},
-			"function_name": &schema.Schema{
+			"dead_letter_config": {
+				Type:     schema.TypeList,
+				Optional: true,
+				ForceNew: true,
+				MinItems: 0,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"target_arn": {
+							Type:         schema.TypeString,
+							Required:     true,
+							ValidateFunc: validateArn,
+						},
+					},
+				},
+			},
+			"function_name": {
 				Type:     schema.TypeString,
 				Required: true,
 				ForceNew: true,
 			},
-			"handler": &schema.Schema{
+			"handler": {
 				Type:     schema.TypeString,
 				Required: true,
 			},
-			"memory_size": &schema.Schema{
+			"memory_size": {
 				Type:     schema.TypeInt,
 				Optional: true,
 				Default:  128,
 			},
-			"role": &schema.Schema{
+			"role": {
 				Type:     schema.TypeString,
 				Required: true,
 			},
-			"runtime": &schema.Schema{
-				Type:     schema.TypeString,
-				Optional: true,
-				ForceNew: true,
-				Default:  "nodejs",
+			"runtime": {
+				Type:         schema.TypeString,
+				Required:     true,
+				ValidateFunc: validateRuntime,
 			},
-			"timeout": &schema.Schema{
+			"timeout": {
 				Type:     schema.TypeInt,
 				Optional: true,
 				Default:  3,
 			},
-			"publish": &schema.Schema{
+			"publish": {
 				Type:     schema.TypeBool,
 				Optional: true,
 				Default:  false,
 			},
-			"version": &schema.Schema{
+			"version": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
-			"vpc_config": &schema.Schema{
+			"vpc_config": {
 				Type:     schema.TypeList,
 				Optional: true,
 				ForceNew: true,
 				Elem: &schema.Resource{
 					Schema: map[string]*schema.Schema{
-						"subnet_ids": &schema.Schema{
+						"subnet_ids": {
 							Type:     schema.TypeSet,
 							Required: true,
 							ForceNew: true,
 							Elem:     &schema.Schema{Type: schema.TypeString},
 							Set:      schema.HashString,
 						},
-						"security_group_ids": &schema.Schema{
+						"security_group_ids": {
 							Type:     schema.TypeSet,
 							Required: true,
 							ForceNew: true,
 							Elem:     &schema.Schema{Type: schema.TypeString},
 							Set:      schema.HashString,
 						},
-						"vpc_id": &schema.Schema{
+						"vpc_id": {
 							Type:     schema.TypeString,
 							Computed: true,
 						},
 					},
 				},
 			},
-			"arn": &schema.Schema{
+			"arn": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
-			"qualified_arn": &schema.Schema{
+			"qualified_arn": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
-			"last_modified": &schema.Schema{
+			"last_modified": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
-			"source_code_hash": &schema.Schema{
+			"source_code_hash": {
 				Type:     schema.TypeString,
 				Optional: true,
 				Computed: true,
+			},
+			"environment": {
+				Type:     schema.TypeList,
+				Optional: true,
+				MaxItems: 1,
+				Elem: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"variables": {
+							Type:     schema.TypeMap,
+							Optional: true,
+							Elem:     schema.TypeString,
+						},
+					},
+				},
+			},
+
+			"kms_key_arn": {
+				Type:         schema.TypeString,
+				Optional:     true,
+				ValidateFunc: validateArn,
 			},
 		},
 	}
@@ -154,24 +189,30 @@ func resourceAwsLambdaFunctionCreate(d *schema.ResourceData, meta interface{}) e
 
 	log.Printf("[DEBUG] Creating Lambda Function %s with role %s", functionName, iamRole)
 
+	filename, hasFilename := d.GetOk("filename")
+	s3Bucket, bucketOk := d.GetOk("s3_bucket")
+	s3Key, keyOk := d.GetOk("s3_key")
+	s3ObjectVersion, versionOk := d.GetOk("s3_object_version")
+
+	if !hasFilename && !bucketOk && !keyOk && !versionOk {
+		return errors.New("filename or s3_* attributes must be set")
+	}
+
 	var functionCode *lambda.FunctionCode
-	if v, ok := d.GetOk("filename"); ok {
+	if hasFilename {
 		// Grab an exclusive lock so that we're only reading one function into
 		// memory at a time.
 		// See https://github.com/hashicorp/terraform/issues/9364
 		awsMutexKV.Lock(awsMutexLambdaKey)
 		defer awsMutexKV.Unlock(awsMutexLambdaKey)
-		file, err := loadFileContent(v.(string))
+		file, err := loadFileContent(filename.(string))
 		if err != nil {
-			return fmt.Errorf("Unable to load %q: %s", v.(string), err)
+			return fmt.Errorf("Unable to load %q: %s", filename.(string), err)
 		}
 		functionCode = &lambda.FunctionCode{
 			ZipFile: file,
 		}
 	} else {
-		s3Bucket, bucketOk := d.GetOk("s3_bucket")
-		s3Key, keyOk := d.GetOk("s3_key")
-		s3ObjectVersion, versionOk := d.GetOk("s3_object_version")
 		if !bucketOk || !keyOk {
 			return errors.New("s3_bucket and s3_key must all be set while using S3 code source")
 		}
@@ -194,6 +235,16 @@ func resourceAwsLambdaFunctionCreate(d *schema.ResourceData, meta interface{}) e
 		Runtime:      aws.String(d.Get("runtime").(string)),
 		Timeout:      aws.Int64(int64(d.Get("timeout").(int))),
 		Publish:      aws.Bool(d.Get("publish").(bool)),
+	}
+
+	if v, ok := d.GetOk("dead_letter_config"); ok {
+		dlcMaps := v.([]interface{})
+		if len(dlcMaps) == 1 { // Schema guarantees either 0 or 1
+			dlcMap := dlcMaps[0].(map[string]interface{})
+			params.DeadLetterConfig = &lambda.DeadLetterConfig{
+				TargetArn: aws.String(dlcMap["target_arn"].(string)),
+			}
+		}
 	}
 
 	if v, ok := d.GetOk("vpc_config"); ok {
@@ -220,10 +271,30 @@ func resourceAwsLambdaFunctionCreate(d *schema.ResourceData, meta interface{}) e
 		}
 	}
 
+	if v, ok := d.GetOk("environment"); ok {
+		environments := v.([]interface{})
+		environment, ok := environments[0].(map[string]interface{})
+		if !ok {
+			return errors.New("At least one field is expected inside environment")
+		}
+
+		if environmentVariables, ok := environment["variables"]; ok {
+			variables := readEnvironmentVariables(environmentVariables.(map[string]interface{}))
+
+			params.Environment = &lambda.Environment{
+				Variables: aws.StringMap(variables),
+			}
+		}
+	}
+
+	if v, ok := d.GetOk("kms_key_arn"); ok {
+		params.KMSKeyArn = aws.String(v.(string))
+	}
+
 	// IAM profiles can take ~10 seconds to propagate in AWS:
 	// http://docs.aws.amazon.com/AWSEC2/latest/UserGuide/iam-roles-for-amazon-ec2.html#launch-instance-with-role-console
 	// Error creating Lambda function: InvalidParameterValueException: The role defined for the task cannot be assumed by Lambda.
-	err := resource.Retry(1*time.Minute, func() *resource.RetryError {
+	err := resource.Retry(10*time.Minute, func() *resource.RetryError {
 		_, err := conn.CreateFunction(params)
 		if err != nil {
 			log.Printf("[ERROR] Received %q, retrying CreateFunction", err)
@@ -282,14 +353,30 @@ func resourceAwsLambdaFunctionRead(d *schema.ResourceData, meta interface{}) err
 	d.Set("role", function.Role)
 	d.Set("runtime", function.Runtime)
 	d.Set("timeout", function.Timeout)
-	if config := flattenLambdaVpcConfigResponse(function.VpcConfig); len(config) > 0 {
-		log.Printf("[INFO] Setting Lambda %s VPC config %#v from API", d.Id(), config)
-		err := d.Set("vpc_config", config)
-		if err != nil {
-			return fmt.Errorf("Failed setting vpc_config: %s", err)
-		}
+	d.Set("kms_key_arn", function.KMSKeyArn)
+
+	config := flattenLambdaVpcConfigResponse(function.VpcConfig)
+	log.Printf("[INFO] Setting Lambda %s VPC config %#v from API", d.Id(), config)
+	vpcSetErr := d.Set("vpc_config", config)
+	if vpcSetErr != nil {
+		return fmt.Errorf("Failed setting vpc_config: %s", vpcSetErr)
 	}
+
 	d.Set("source_code_hash", function.CodeSha256)
+
+	if err := d.Set("environment", flattenLambdaEnvironment(function.Environment)); err != nil {
+		log.Printf("[ERR] Error setting environment for Lambda Function (%s): %s", d.Id(), err)
+	}
+
+	if function.DeadLetterConfig != nil && function.DeadLetterConfig.TargetArn != nil {
+		d.Set("dead_letter_config", []interface{}{
+			map[string]interface{}{
+				"target_arn": *function.DeadLetterConfig.TargetArn,
+			},
+		})
+	} else {
+		d.Set("dead_letter_config", []interface{}{})
+	}
 
 	// List is sorted from oldest to latest
 	// so this may get costly over time :'(
@@ -429,6 +516,47 @@ func resourceAwsLambdaFunctionUpdate(d *schema.ResourceData, meta interface{}) e
 		configReq.Timeout = aws.Int64(int64(d.Get("timeout").(int)))
 		configUpdate = true
 	}
+	if d.HasChange("kms_key_arn") {
+		configReq.KMSKeyArn = aws.String(d.Get("kms_key_arn").(string))
+		configUpdate = true
+	}
+	if d.HasChange("dead_letter_config") {
+		dlcMaps := d.Get("dead_letter_config").([]interface{})
+		if len(dlcMaps) == 1 { // Schema guarantees either 0 or 1
+			dlcMap := dlcMaps[0].(map[string]interface{})
+			configReq.DeadLetterConfig = &lambda.DeadLetterConfig{
+				TargetArn: aws.String(dlcMap["target_arn"].(string)),
+			}
+			configUpdate = true
+		}
+	}
+	if d.HasChange("runtime") {
+		configReq.Runtime = aws.String(d.Get("runtime").(string))
+		configUpdate = true
+	}
+	if d.HasChange("environment") {
+		if v, ok := d.GetOk("environment"); ok {
+			environments := v.([]interface{})
+			environment, ok := environments[0].(map[string]interface{})
+			if !ok {
+				return errors.New("At least one field is expected inside environment")
+			}
+
+			if environmentVariables, ok := environment["variables"]; ok {
+				variables := readEnvironmentVariables(environmentVariables.(map[string]interface{}))
+
+				configReq.Environment = &lambda.Environment{
+					Variables: aws.StringMap(variables),
+				}
+				configUpdate = true
+			}
+		} else {
+			configReq.Environment = &lambda.Environment{
+				Variables: aws.StringMap(map[string]string{}),
+			}
+			configUpdate = true
+		}
+	}
 
 	if configUpdate {
 		log.Printf("[DEBUG] Send Update Lambda Function Configuration request: %#v", configReq)
@@ -460,6 +588,15 @@ func loadFileContent(v string) ([]byte, error) {
 	return fileContent, nil
 }
 
+func readEnvironmentVariables(ev map[string]interface{}) map[string]string {
+	variables := make(map[string]string)
+	for k, v := range ev {
+		variables[k] = v.(string)
+	}
+
+	return variables
+}
+
 func validateVPCConfig(v interface{}) (map[string]interface{}, error) {
 	configs := v.([]interface{})
 	if len(configs) > 1 {
@@ -486,4 +623,15 @@ func validateVPCConfig(v interface{}) (map[string]interface{}, error) {
 	}
 
 	return config, nil
+}
+
+func validateRuntime(v interface{}, k string) (ws []string, errors []error) {
+	runtime := v.(string)
+
+	if runtime == lambda.RuntimeNodejs {
+		errors = append(errors, fmt.Errorf(
+			"%s has reached end of life since October 2016 and has been deprecated in favor of %s.",
+			runtime, lambda.RuntimeNodejs43))
+	}
+	return
 }

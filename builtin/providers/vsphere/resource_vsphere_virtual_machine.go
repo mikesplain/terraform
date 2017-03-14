@@ -1094,6 +1094,9 @@ func resourceVSphereVirtualMachineRead(d *schema.ResourceData, meta interface{})
 						}
 						if gatewaySetting != "" {
 							deviceID, err := strconv.Atoi(route.Gateway.Device)
+							if len(networkInterfaces) == 1 {
+								deviceID = 0
+							}
 							if err != nil {
 								log.Printf("[WARN] error at processing %s of device id %#v: %#v", gatewaySetting, route.Gateway.Device, err)
 							} else {
@@ -2153,7 +2156,14 @@ func (vm *virtualMachine) setupVirtualMachine(c *govmomi.Client) error {
 	}
 
 	if vm.hasBootableVmdk || vm.template != "" {
-		newVM.PowerOn(context.TODO())
+		t, err := newVM.PowerOn(context.TODO())
+		if err != nil {
+			return err
+		}
+		_, err = t.WaitForResult(context.TODO(), nil)
+		if err != nil {
+			return err
+		}
 		err = newVM.WaitForPowerState(context.TODO(), types.VirtualMachinePowerStatePoweredOn)
 		if err != nil {
 			return err
